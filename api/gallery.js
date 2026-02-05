@@ -2,16 +2,40 @@
 import { sql } from '@vercel/postgres';
 import { v2 as cloudinary } from 'cloudinary';
 
-// Configuración de Cloudinary usando la variable de entorno estándar
-if (process.env.CLOUDINARY_URL) {
-  cloudinary.config({
-    cloudinary_api_url: process.env.CLOUDINARY_URL,
-    secure: true
-  });
+/**
+ * Procesa la CLOUDINARY_URL para limpiar posibles caracteres < > 
+ * que el usuario haya incluido por error en las variables de entorno.
+ */
+function initializeCloudinary() {
+  const rawUrl = process.env.CLOUDINARY_URL;
+  if (!rawUrl) return false;
+
+  try {
+    // Eliminamos los brackets < > y espacios en blanco
+    const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
+    
+    // El formato esperado es cloudinary://API_KEY:API_SECRET@CLOUD_NAME
+    const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
+    const match = cleanUrl.match(regex);
+
+    if (match) {
+      cloudinary.config({
+        api_key: match[1],
+        api_secret: match[2],
+        cloud_name: match[3],
+        secure: true
+      });
+      return true;
+    }
+  } catch (err) {
+    console.error('Error parseando CLOUDINARY_URL:', err);
+  }
+  return false;
 }
 
+const isCloudinaryConfigured = initializeCloudinary();
+
 export default async function handler(request, response) {
-  // CORS Headers
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -24,7 +48,6 @@ export default async function handler(request, response) {
       throw new Error('Falta la variable de entorno POSTGRES_URL');
     }
 
-    // 1. Obtener los álbumes/carpetas registrados en la DB
     let dbResult;
     try {
       dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
@@ -34,27 +57,23 @@ export default async function handler(request, response) {
 
     const allPhotos = [];
 
-    // 2. Iterar sobre cada registro para expandir colecciones si es necesario
     for (const item of dbResult.rows) {
-      const isCollectionUrl = item.url.includes('collection.cloudinary.com');
+      const isCollection = item.url.includes('collection.cloudinary.com');
 
-      if (isCollectionUrl && process.env.CLOUDINARY_URL) {
+      if (isCollection && isCloudinaryConfigured) {
         try {
-          // Extraer el ID de la colección de la URL (el último segmento)
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          /**
-           * Utilizamos el Search API para buscar por collection_id.
-           * Es el método más fiable para URLs compartidas de la Media Library.
-           */
-          const searchResult = await cloudinary.search
+          // El Search API requiere que los assets estén indexados
+          const result = await cloudinary.search
             .expression(`collection_id:${collectionId}`)
+            .sort_by('created_at', 'desc')
             .max_results(100)
             .execute();
 
-          if (searchResult.resources && searchResult.resources.length > 0) {
-            searchResult.resources.forEach(asset => {
+          if (result && result.resources && result.resources.length > 0) {
+            result.resources.forEach(asset => {
               allPhotos.push({
                 id: asset.public_id,
                 url: asset.secure_url,
@@ -66,29 +85,26 @@ export default async function handler(request, response) {
               });
             });
           } else {
-            // Si el Search API no encuentra nada con collection_id, 
-            // intentamos como fallback el ID de la colección mediante el API de Admin (si estuviera soportado)
-            console.warn(`No se encontraron assets para la colección: ${collectionId}`);
+            // Si no hay resultados en el search, mantenemos el registro de la DB como placeholder
             allPhotos.push({
               ...item,
               id: `empty-${item.id}`,
-              nombre: 'Colección vacía o no indexada'
+              nombre: `${item.carpeta} (Sin archivos encontrados)`
             });
           }
         } catch (colError) {
-          console.error(`Error procesando colección ${item.url}:`, colError.message);
-          // Fallback: mostrar al menos la entrada de la base de datos
+          console.error(`Fallo en Search API para ${item.url}:`, colError.message || colError);
           allPhotos.push({
             ...item,
             id: `err-${item.id}`,
-            nombre: `Error: ${colError.message}`
+            nombre: `Error de conexión: ${colError.http_code || 'Cloudinary'}`
           });
         }
       } else {
-        // Es una URL de imagen normal o Cloudinary individual
+        // Entrada normal (URL directa)
         allPhotos.push({
           ...item,
-          id: item.id || Math.random().toString(36).substr(2, 9),
+          id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
           nombre: item.nombre || 'Imagen'
         });
       }
@@ -97,10 +113,7 @@ export default async function handler(request, response) {
     return response.status(200).json(allPhotos);
 
   } catch (error) {
-    console.error('API Error General:', error);
-    return response.status(500).json({ 
-      error: 'Internal Server Error', 
-      message: error.message 
-    });
+    console.error('Error Crítico API:', error);
+    return response.status(500).json({ error: error.message });
   }
 }

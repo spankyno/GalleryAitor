@@ -8,6 +8,12 @@ export const fetchPhotos = async (): Promise<Photo[]> => {
     if (response.ok) {
       const data = await response.json();
       
+      // Validar que data sea un array
+      if (!Array.isArray(data)) {
+        console.error('La API no devolvió un array:', data);
+        return [];
+      }
+      
       return data.map((item: any) => ({
         id: item.id?.toString() || Math.random().toString(),
         url: item.url, 
@@ -35,7 +41,6 @@ export const getFoldersFromPhotos = (photos: Photo[]): string[] => {
 
 export const downloadPhoto = async (url: string, filename: string) => {
   try {
-    // Para Cloudinary, forzamos la descarga añadiendo fl_attachment
     const downloadUrl = url.includes('upload/') 
       ? url.replace('upload/', 'upload/fl_attachment/')
       : url;
