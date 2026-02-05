@@ -2,33 +2,27 @@ import { sql } from '@vercel/postgres';
 import { v2 as cloudinary } from 'cloudinary';
 
 /**
- * Procesa la CLOUDINARY_URL eliminando caracteres < > y configurando el SDK.
+ * Configura Cloudinary limpiando caracteres < > de la URL y usando el soporte nativo de cloudinary_url.
  */
 function configureCloudinary() {
   const rawUrl = process.env.CLOUDINARY_URL;
   if (!rawUrl) {
-    console.error('CLOUDINARY_URL no está definida en las variables de entorno.');
+    console.error('CLOUDINARY_URL no definida');
     return false;
   }
 
   try {
+    // Limpieza de posibles brackets pegados desde el panel de Vercel
     const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
-    const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
-    const match = cleanUrl.match(regex);
-
-    if (match) {
-      cloudinary.config({
-        api_key: match[1],
-        api_secret: match[2],
-        cloud_name: match[3],
-        secure: true
-      });
-      return true;
-    } else {
-      console.error('El formato de CLOUDINARY_URL es inválido.');
-    }
+    
+    // Configuración directa mediante URL, que es el método más fiable
+    cloudinary.config({
+      cloudinary_url: cleanUrl,
+      secure: true
+    });
+    return true;
   } catch (err) {
-    console.error('Error al configurar Cloudinary:', err);
+    console.error('Error configurando Cloudinary:', err);
   }
   return false;
 }
@@ -36,6 +30,7 @@ function configureCloudinary() {
 const isConfigured = configureCloudinary();
 
 export default async function handler(request, response) {
+  // Headers CORS
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -63,8 +58,9 @@ export default async function handler(request, response) {
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          // Usamos collection_assets del ADMIN API, no el Search API.
-          const result = await cloudinary.api.collection_assets(collectionId, {
+          // Utilizar el método oficial: cloudinary.api.collection
+          // Este método devuelve los detalles de la colección, incluyendo el array 'resources'
+          const result = await cloudinary.api.collection(collectionId, {
             max_results: 100
           });
 
@@ -83,14 +79,15 @@ export default async function handler(request, response) {
           }
         } catch (error) {
           console.error(`Error procesando colección ${item.carpeta}:`, error.message);
-          // Fallback: mostrar el item de la DB si falla la API
+          // Fallback: mostrar la entrada original con aviso de error
           allPhotos.push({
             ...item,
-            id: `db-${item.id}`,
-            nombre: `${item.nombre || item.carpeta} (Error API)`
+            id: `err-${item.id}`,
+            nombre: `${item.carpeta} (Error: ${error.message})`
           });
         }
       } else {
+        // Imagen individual o URL no Cloudinary
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
@@ -102,7 +99,7 @@ export default async function handler(request, response) {
     return response.status(200).json(allPhotos);
 
   } catch (error) {
-    console.error('Error Crítico:', error);
+    console.error('Error Crítico API:', error);
     return response.status(500).json({ error: error.message });
   }
 }
