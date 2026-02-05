@@ -1,8 +1,7 @@
 import { sql } from '@vercel/postgres';
 
 /**
- * Extrae credenciales de la URL de Cloudinary.
- * Formato esperado: cloudinary://api_key:api_secret@cloud_name
+ * Extrae credenciales de la URL de Cloudinary de forma robusta.
  */
 function getCloudinaryCredentials() {
   const rawUrl = process.env.CLOUDINARY_URL;
@@ -10,15 +9,13 @@ function getCloudinaryCredentials() {
 
   try {
     const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
-    const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
-    const match = cleanUrl.match(regex);
-    
-    if (match) {
+    if (cleanUrl.startsWith('cloudinary://')) {
+      const url = new URL(cleanUrl);
       return {
-        apiKey: match[1],
-        apiSecret: match[2],
-        cloudName: match[3],
-        auth: Buffer.from(`${match[1]}:${match[2]}`).toString('base64')
+        apiKey: url.username,
+        apiSecret: url.password,
+        cloudName: url.hostname,
+        auth: Buffer.from(`${url.username}:${url.password}`).toString('base64')
       };
     }
   } catch (err) {
@@ -54,22 +51,33 @@ export default async function handler(request, response) {
 
       if (isCollection && creds) {
         try {
-          const urlParts = item.url.split('/');
-          const collectionId = urlParts[urlParts.length - 1];
+          // Extraer ID de forma segura (ignorando slashes al final)
+          const collectionId = item.url.split('/').filter(Boolean).pop();
+          
+          if (!collectionId) throw new Error('No se pudo determinar el ID de la colección');
 
-          // Llamada directa a la API REST de Cloudinary (Admin API)
-          // Documentación: https://cloudinary.com/documentation/admin_api#get_details_of_a_single_collection
           const apiUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}`;
           
           const cloudinaryResponse = await fetch(apiUrl, {
             headers: {
-              'Authorization': `Basic ${creds.auth}`
+              'Authorization': `Basic ${creds.auth}`,
+              'Accept': 'application/json'
             }
           });
 
+          const contentType = cloudinaryResponse.headers.get('content-type');
+          
           if (!cloudinaryResponse.ok) {
-            const errorData = await cloudinaryResponse.json();
-            throw new Error(errorData.error?.message || `HTTP ${cloudinaryResponse.status}`);
+            let errorMsg = `HTTP ${cloudinaryResponse.status}`;
+            if (contentType && contentType.includes('application/json')) {
+              const errorData = await cloudinaryResponse.json();
+              errorMsg = errorData.error?.message || errorMsg;
+            }
+            throw new Error(errorMsg);
+          }
+
+          if (!contentType || !contentType.includes('application/json')) {
+            throw new Error('La respuesta de Cloudinary no es JSON (posible URL incorrecta o bloqueo)');
           }
 
           const data = await cloudinaryResponse.json();
@@ -92,7 +100,7 @@ export default async function handler(request, response) {
           allPhotos.push({
             ...item,
             id: `err-${item.id}-${Math.random().toString(36).substr(2, 5)}`,
-            nombre: `${item.carpeta} (No disponible: ${error.message})`
+            nombre: `${item.carpeta} (Error: ${error.message})`
           });
         }
       } else {
