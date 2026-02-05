@@ -1,30 +1,42 @@
 
 import { db } from '@vercel/postgres';
 
-/**
- * Este archivo es una Vercel Serverless Function.
- * Se encarga de conectar con tu base de datos Vercel Postgres (Neon)
- * y devolver los registros de la tabla "Gallery".
- */
 export default async function handler(request, response) {
+  // Configuración de cabeceras para evitar problemas de caché y CORS
+  response.setHeader('Access-Control-Allow-Origin', '*');
+  response.setHeader('Content-Type', 'application/json');
+
   try {
-    // Establecer conexión con la base de datos
-    // Requiere que la variable POSTGRES_URL esté configurada en Vercel Settings
+    // 1. Verificar variables de entorno
+    if (!process.env.POSTGRES_URL) {
+      return response.status(500).json({ 
+        error: 'Configuración incompleta', 
+        message: 'No se encontró la variable POSTGRES_URL en Vercel.' 
+      });
+    }
+
     const client = await db.connect();
     
-    // Ejecutar la consulta SQL para obtener todas las fotos
-    // Se ordena por ID descendente para ver las últimas primero
-    const { rows } = await client.query('SELECT * FROM gallery ORDER BY id DESC');
-    
-    // Responder con los datos en formato JSON
-    return response.status(200).json(rows);
+    let result;
+    try {
+      // Intentamos con comillas dobles por si la tabla se creó respetando mayúsculas
+      result = await client.query('SELECT * FROM "Gallery" ORDER BY id DESC');
+    } catch (e) {
+      console.log('Fallo con "Gallery" (mayúsculas), probando con gallery (minúsculas)...');
+      // Si falla, intentamos en minúsculas (comportamiento estándar de Postgres)
+      result = await client.query('SELECT * FROM gallery ORDER BY id DESC');
+    }
+
+    return response.status(200).json(result.rows);
+
   } catch (error) {
-    // Manejo de errores detallado en la consola de Vercel
-    console.error('Error en /api/gallery:', error);
+    console.error('Error crítico en la función gallery.js:', error);
     
     return response.status(500).json({ 
-      error: 'Error al obtener los datos de la galería',
-      message: error.message 
+      error: 'Error de ejecución en el servidor',
+      message: error.message,
+      code: error.code,
+      hint: 'Revisa si la tabla existe en tu base de datos y si el nombre es correcto.'
     });
   }
 }
