@@ -8,15 +8,12 @@ import { sql } from '@vercel/postgres';
 function parseCloudinaryUrl(url) {
   if (!url) return null;
   try {
-    const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
-    const matches = url.match(regex);
-    if (!matches) return null;
-    return {
-      apiKey: matches[1],
-      apiSecret: matches[2],
-      cloudName: matches[3]
-    };
+    const cleanUrl = url.replace('cloudinary://', '');
+    const [credentials, cloudName] = cleanUrl.split('@');
+    const [apiKey, apiSecret] = credentials.split(':');
+    return { apiKey, apiSecret, cloudName };
   } catch (e) {
+    console.error("Error parseando CLOUDINARY_URL:", e);
     return null;
   }
 }
@@ -33,7 +30,7 @@ export default async function handler(request, response) {
 
   try {
     if (!process.env.POSTGRES_URL) {
-      throw new Error('Falta POSTGRES_URL');
+      throw new Error('Falta la variable de entorno POSTGRES_URL');
     }
 
     // 1. Obtener registros de la base de datos
@@ -55,24 +52,36 @@ export default async function handler(request, response) {
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          // Llamada directa a la API de Cloudinary (Admin API)
-          // Endpoint: GET /collections/:collection_id/assets
+          // Autenticación para Cloudinary
           const auth = Buffer.from(`${cloudConfig.apiKey}:${cloudConfig.apiSecret}`).toString('base64');
-          const apiUrl = `https://api.cloudinary.com/v1_1/${cloudConfig.cloudName}/collections/${collectionId}/assets`;
-
-          const cloudinaryResponse = await fetch(apiUrl, {
+          
+          /**
+           * Usamos el Search API en lugar del Collections API directo.
+           * El Search API permite buscar recursos que pertenezcan a una colección específica.
+           */
+          const searchUrl = `https://api.cloudinary.com/v1_1/${cloudConfig.cloudName}/resources/search`;
+          
+          const cloudinaryResponse = await fetch(searchUrl, {
+            method: 'POST',
             headers: {
-              'Authorization': `Basic ${auth}`
-            }
+              'Authorization': `Basic ${auth}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              expression: `collection_id:${collectionId}`,
+              max_results: 100,
+              with_field: ["context", "metadata"]
+            })
           });
 
           if (!cloudinaryResponse.ok) {
-            throw new Error(`Cloudinary API respondió con ${cloudinaryResponse.status}`);
+            const errorText = await cloudinaryResponse.text();
+            throw new Error(`Cloudinary Search API Error (${cloudinaryResponse.status}): ${errorText}`);
           }
 
           const cloudinaryData = await cloudinaryResponse.json();
           
-          if (cloudinaryData.resources) {
+          if (cloudinaryData.resources && cloudinaryData.resources.length > 0) {
             cloudinaryData.resources.forEach(asset => {
               allPhotos.push({
                 id: asset.public_id,
@@ -84,13 +93,22 @@ export default async function handler(request, response) {
                 size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
               });
             });
+          } else {
+            // Si el Search API no devuelve nada por ID, intentamos un fallback 
+            // Esto sucede si el ID de la URL no es el ID interno del Search API
+            console.warn(`No se encontraron recursos para la colección ${collectionId} usando Search API.`);
+            allPhotos.push({
+              ...item,
+              id: item.id || `fallback-${Math.random()}`,
+              nombre: 'Colección vacía o privada'
+            });
           }
         } catch (colError) {
-          console.error(`Error expandiendo colección ${item.url}:`, colError);
+          console.error(`Error expandiendo colección ${item.url}:`, colError.message);
           allPhotos.push({
             ...item,
             id: item.id || `err-${Math.random()}`,
-            nombre: 'Error al cargar colección'
+            nombre: 'Error al expandir colección'
           });
         }
       } else {
