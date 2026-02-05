@@ -2,35 +2,30 @@ import { sql } from '@vercel/postgres';
 import { v2 as cloudinary } from 'cloudinary';
 
 /**
- * Configura Cloudinary limpiando caracteres < > de la URL y usando el soporte nativo de cloudinary_url.
+ * Configura Cloudinary limpiando la URL de posibles caracteres extraños.
  */
 function configureCloudinary() {
   const rawUrl = process.env.CLOUDINARY_URL;
-  if (!rawUrl) {
-    console.error('CLOUDINARY_URL no definida');
-    return false;
-  }
+  if (!rawUrl) return false;
 
   try {
-    // Limpieza de posibles brackets pegados desde el panel de Vercel
+    // Elimina posibles brackets o espacios
     const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
-    
-    // Configuración directa mediante URL, que es el método más fiable
     cloudinary.config({
       cloudinary_url: cleanUrl,
       secure: true
     });
     return true;
   } catch (err) {
-    console.error('Error configurando Cloudinary:', err);
+    console.error('Error al configurar Cloudinary:', err);
+    return false;
   }
-  return false;
 }
 
 const isConfigured = configureCloudinary();
 
 export default async function handler(request, response) {
-  // Headers CORS
+  // Headers CORS para despliegues Vercel
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -43,6 +38,7 @@ export default async function handler(request, response) {
 
     let dbResult;
     try {
+      // Intentamos con comillas por si la tabla tiene mayúsculas
       dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
     } catch (e) {
       dbResult = await sql`SELECT * FROM Gallery ORDER BY id ASC`;
@@ -51,16 +47,21 @@ export default async function handler(request, response) {
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      const isCollection = item.url.includes('collection.cloudinary.com');
+      const isCollection = item.url && item.url.includes('collection.cloudinary.com');
 
       if (isCollection && isConfigured) {
         try {
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          // Utilizar el método oficial: cloudinary.api.collection
-          // Este método devuelve los detalles de la colección, incluyendo el array 'resources'
-          const result = await cloudinary.api.collection(collectionId, {
+          // Detección dinámica de método para evitar "is not a function"
+          const apiMethod = cloudinary.api.resources_by_collection || cloudinary.api.collection;
+          
+          if (typeof apiMethod !== 'function') {
+            throw new Error('Método de colecciones no disponible en el SDK');
+          }
+
+          const result = await apiMethod(collectionId, {
             max_results: 100
           });
 
@@ -78,16 +79,16 @@ export default async function handler(request, response) {
             });
           }
         } catch (error) {
-          console.error(`Error procesando colección ${item.carpeta}:`, error.message);
-          // Fallback: mostrar la entrada original con aviso de error
+          console.error(`Error en carpeta ${item.carpeta}:`, error.message);
+          // Fallback: mostrar al menos la entrada de la base de datos
           allPhotos.push({
             ...item,
-            id: `err-${item.id}`,
-            nombre: `${item.carpeta} (Error: ${error.message})`
+            id: `err-${item.id}-${Math.random().toString(36).substr(2, 5)}`,
+            nombre: `${item.carpeta} (Error de sincronización)`
           });
         }
       } else {
-        // Imagen individual o URL no Cloudinary
+        // Imagen estándar o registro directo de DB
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
@@ -99,7 +100,7 @@ export default async function handler(request, response) {
     return response.status(200).json(allPhotos);
 
   } catch (error) {
-    console.error('Error Crítico API:', error);
+    console.error('Error crítico API:', error);
     return response.status(500).json({ error: error.message });
   }
 }
