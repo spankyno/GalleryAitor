@@ -1,13 +1,24 @@
 
 import { sql } from '@vercel/postgres';
-import { v2 as cloudinary } from 'cloudinary';
 
-// Configurar Cloudinary usando la variable de entorno CLOUDINARY_URL
-// Formato esperado: cloudinary://API_KEY:API_SECRET@CLOUD_NAME
-if (process.env.CLOUDINARY_URL) {
-  cloudinary.config({
-    cloudinary_url: process.env.CLOUDINARY_URL
-  });
+/**
+ * Parsea el CLOUDINARY_URL para extraer credenciales
+ * Formato: cloudinary://api_key:api_secret@cloud_name
+ */
+function parseCloudinaryUrl(url) {
+  if (!url) return null;
+  try {
+    const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
+    const matches = url.match(regex);
+    if (!matches) return null;
+    return {
+      apiKey: matches[1],
+      apiSecret: matches[2],
+      cloudName: matches[3]
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 export default async function handler(request, response) {
@@ -17,6 +28,8 @@ export default async function handler(request, response) {
   response.setHeader('Content-Type', 'application/json');
 
   if (request.method === 'OPTIONS') return response.status(200).end();
+
+  const cloudConfig = parseCloudinaryUrl(process.env.CLOUDINARY_URL);
 
   try {
     if (!process.env.POSTGRES_URL) {
@@ -37,39 +50,55 @@ export default async function handler(request, response) {
     for (const item of dbResult.rows) {
       const isCollection = item.url.includes('collection.cloudinary.com');
 
-      if (isCollection && process.env.CLOUDINARY_URL) {
+      if (isCollection && cloudConfig) {
         try {
-          // Extraer el ID de la colección de la URL
-          // Ejemplo: https://collection.cloudinary.com/nombre/ID_COLECCION
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          // Llamar a la API de Cloudinary para obtener los assets de la colección
-          const cloudinaryData = await cloudinary.api.collection_assets(collectionId);
+          // Llamada directa a la API de Cloudinary (Admin API)
+          // Endpoint: GET /collections/:collection_id/assets
+          const auth = Buffer.from(`${cloudConfig.apiKey}:${cloudConfig.apiSecret}`).toString('base64');
+          const apiUrl = `https://api.cloudinary.com/v1_1/${cloudConfig.cloudName}/collections/${collectionId}/assets`;
+
+          const cloudinaryResponse = await fetch(apiUrl, {
+            headers: {
+              'Authorization': `Basic ${auth}`
+            }
+          });
+
+          if (!cloudinaryResponse.ok) {
+            throw new Error(`Cloudinary API respondió con ${cloudinaryResponse.status}`);
+          }
+
+          const cloudinaryData = await cloudinaryResponse.json();
           
           if (cloudinaryData.resources) {
             cloudinaryData.resources.forEach(asset => {
               allPhotos.push({
                 id: asset.public_id,
                 url: asset.secure_url,
-                carpeta: item.carpeta, // Mantenemos el nombre de carpeta definido en la DB
+                carpeta: item.carpeta,
                 nombre: asset.filename || asset.public_id.split('/').pop(),
                 fecha: asset.created_at,
-                formato: asset.format.toUpperCase(),
-                size: (asset.bytes / 1024 / 1024).toFixed(2) + ' MB'
+                formato: asset.format ? asset.format.toUpperCase() : 'IMG',
+                size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
               });
             });
           }
         } catch (colError) {
           console.error(`Error expandiendo colección ${item.url}:`, colError);
-          // Si falla la expansión, añadimos el item original como fallback (aunque sea una URL de página)
-          allPhotos.push(item);
+          allPhotos.push({
+            ...item,
+            id: item.id || `err-${Math.random()}`,
+            nombre: 'Error al cargar colección'
+          });
         }
       } else {
-        // Es una URL directa o no tenemos API Key, la añadimos tal cual
+        // Es una URL de imagen directa (la mostramos tal cual)
         allPhotos.push({
           ...item,
-          id: item.id || Math.random().toString(36).substr(2, 9)
+          id: item.id || Math.random().toString(36).substr(2, 9),
+          nombre: item.nombre || 'Imagen directa'
         });
       }
     }
