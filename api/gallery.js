@@ -1,20 +1,18 @@
-
 import { sql } from '@vercel/postgres';
 import { v2 as cloudinary } from 'cloudinary';
 
 /**
- * Procesa la CLOUDINARY_URL para limpiar posibles caracteres < > 
- * que el usuario haya incluido por error en las variables de entorno.
+ * Procesa la CLOUDINARY_URL eliminando caracteres < > y configurando el SDK.
  */
-function initializeCloudinary() {
+function configureCloudinary() {
   const rawUrl = process.env.CLOUDINARY_URL;
-  if (!rawUrl) return false;
+  if (!rawUrl) {
+    console.error('CLOUDINARY_URL no está definida en las variables de entorno.');
+    return false;
+  }
 
   try {
-    // Eliminamos los brackets < > y espacios en blanco
     const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
-    
-    // El formato esperado es cloudinary://API_KEY:API_SECRET@CLOUD_NAME
     const regex = /cloudinary:\/\/([^:]+):([^@]+)@(.+)/;
     const match = cleanUrl.match(regex);
 
@@ -26,14 +24,16 @@ function initializeCloudinary() {
         secure: true
       });
       return true;
+    } else {
+      console.error('El formato de CLOUDINARY_URL es inválido.');
     }
   } catch (err) {
-    console.error('Error parseando CLOUDINARY_URL:', err);
+    console.error('Error al configurar Cloudinary:', err);
   }
   return false;
 }
 
-const isCloudinaryConfigured = initializeCloudinary();
+const isConfigured = configureCloudinary();
 
 export default async function handler(request, response) {
   response.setHeader('Access-Control-Allow-Origin', '*');
@@ -44,9 +44,7 @@ export default async function handler(request, response) {
   if (request.method === 'OPTIONS') return response.status(200).end();
 
   try {
-    if (!process.env.POSTGRES_URL) {
-      throw new Error('Falta la variable de entorno POSTGRES_URL');
-    }
+    if (!process.env.POSTGRES_URL) throw new Error('POSTGRES_URL no definida');
 
     let dbResult;
     try {
@@ -60,19 +58,17 @@ export default async function handler(request, response) {
     for (const item of dbResult.rows) {
       const isCollection = item.url.includes('collection.cloudinary.com');
 
-      if (isCollection && isCloudinaryConfigured) {
+      if (isCollection && isConfigured) {
         try {
           const urlParts = item.url.split('/');
           const collectionId = urlParts[urlParts.length - 1];
 
-          // El Search API requiere que los assets estén indexados
-          const result = await cloudinary.search
-            .expression(`collection_id:${collectionId}`)
-            .sort_by('created_at', 'desc')
-            .max_results(100)
-            .execute();
+          // Usamos collection_assets del ADMIN API, no el Search API.
+          const result = await cloudinary.api.collection_assets(collectionId, {
+            max_results: 100
+          });
 
-          if (result && result.resources && result.resources.length > 0) {
+          if (result && result.resources) {
             result.resources.forEach(asset => {
               allPhotos.push({
                 id: asset.public_id,
@@ -84,24 +80,17 @@ export default async function handler(request, response) {
                 size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
               });
             });
-          } else {
-            // Si no hay resultados en el search, mantenemos el registro de la DB como placeholder
-            allPhotos.push({
-              ...item,
-              id: `empty-${item.id}`,
-              nombre: `${item.carpeta} (Sin archivos encontrados)`
-            });
           }
-        } catch (colError) {
-          console.error(`Fallo en Search API para ${item.url}:`, colError.message || colError);
+        } catch (error) {
+          console.error(`Error procesando colección ${item.carpeta}:`, error.message);
+          // Fallback: mostrar el item de la DB si falla la API
           allPhotos.push({
             ...item,
-            id: `err-${item.id}`,
-            nombre: `Error de conexión: ${colError.http_code || 'Cloudinary'}`
+            id: `db-${item.id}`,
+            nombre: `${item.nombre || item.carpeta} (Error API)`
           });
         }
       } else {
-        // Entrada normal (URL directa)
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
@@ -113,7 +102,7 @@ export default async function handler(request, response) {
     return response.status(200).json(allPhotos);
 
   } catch (error) {
-    console.error('Error Crítico API:', error);
+    console.error('Error Crítico:', error);
     return response.status(500).json({ error: error.message });
   }
 }
