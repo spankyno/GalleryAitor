@@ -1,0 +1,5 @@
+{
+  "name": "Cloudinary Gallery Pro",
+  "description": "A high-performance, modern photo gallery visualizer with folder navigation, multiple view modes (Grid, Mosaic, List), and Cloudinary integration.",
+  "requestFramePermissions": []
+}
