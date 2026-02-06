@@ -2,7 +2,7 @@ import { sql } from '@vercel/postgres';
 
 /**
  * Extrae credenciales de la URL de Cloudinary de forma robusta.
- * Formato: cloudinary://api_key:api_secret@cloud_name
+ * Formato esperado: cloudinary://api_key:api_secret@cloud_name
  */
 function getCloudinaryCredentials() {
   const rawUrl = process.env.CLOUDINARY_URL;
@@ -26,6 +26,7 @@ function getCloudinaryCredentials() {
 }
 
 export default async function handler(request, response) {
+  // CORS Headers
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -48,7 +49,7 @@ export default async function handler(request, response) {
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      // Detección de URL de colección
+      // Detección de URL de colección compartida
       const isCollection = item.url && (
         item.url.includes('collection.cloudinary.com') || 
         item.url.includes('/collections/')
@@ -56,42 +57,40 @@ export default async function handler(request, response) {
 
       if (isCollection && creds) {
         try {
-          /**
-           * ANALISIS DE LA URL DE COLECCION
-           * Ejemplo: https://collection.cloudinary.com/mi-cloud/abc123def456/view
-           */
           const urlObj = new URL(item.url);
           const pathParts = urlObj.pathname.split('/').filter(Boolean);
           
           let targetCloudName = creds.cloudName;
           let collectionId = '';
 
+          // Caso: https://collection.cloudinary.com/kalbo/641a664a4d00ceee7d208df007a7c17d
           if (urlObj.hostname === 'collection.cloudinary.com') {
-            // En collection.cloudinary.com, el primer path suele ser el cloud name
-            // y el segundo es el ID de la colección.
             if (pathParts.length >= 2) {
-              targetCloudName = pathParts[0];
-              collectionId = pathParts[1];
+              targetCloudName = pathParts[0]; // 'kalbo'
+              collectionId = pathParts[1];    // '641a...c17d'
             }
           } else {
-            // URLs tipo .../v1_1/cloudname/collections/id
+            // Caso: URLs de API v1_1 u otras variantes
             const collIndex = pathParts.indexOf('collections');
             if (collIndex !== -1 && pathParts[collIndex + 1]) {
               collectionId = pathParts[collIndex + 1];
-              // El cloudName suele estar antes de /collections/
               if (collIndex > 0) targetCloudName = pathParts[collIndex - 1];
             } else {
-              // Fallback: último segmento
               collectionId = pathParts.filter(p => p !== 'view' && p !== 'edit').pop();
             }
           }
           
           if (!collectionId) throw new Error('No se pudo identificar el ID de la colección');
 
-          // IMPORTANTE: La API de Administración SIEMPRE usa el Cloud Name asociado a la API Key.
-          // Si la colección pertenece a otro Cloud Name, la API Key debe tener permisos sobre él.
-          const apiUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}`;
+          /**
+           * DOCUMENTACION CLOUDINARY ADMIN API:
+           * Endpoint para obtener recursos de una colección:
+           * GET /collections/:collection_external_id/assets
+           */
+          const apiUrl = `https://api.cloudinary.com/v1_1/${targetCloudName}/collections/${collectionId}/assets`;
           
+          console.log(`Consultando colección: ${apiUrl} usando cloud ${targetCloudName}`);
+
           const cloudinaryResponse = await fetch(apiUrl, {
             headers: {
               'Authorization': `Basic ${creds.auth}`,
@@ -101,43 +100,41 @@ export default async function handler(request, response) {
 
           if (!cloudinaryResponse.ok) {
             const errorText = await cloudinaryResponse.text();
-            let errorDetail = `Error ${cloudinaryResponse.status}`;
+            let errorMsg = `HTTP ${cloudinaryResponse.status}`;
             try {
               const errorData = JSON.parse(errorText);
-              errorDetail = errorData.error?.message || errorDetail;
+              errorMsg = errorData.error?.message || errorMsg;
             } catch (e) {}
             
-            if (cloudinaryResponse.status === 404) {
-              throw new Error(`Colección no encontrada (ID: ${collectionId} en Cloud: ${creds.cloudName})`);
+            // Si falla con el cloud de la URL, reintentar con el cloud de las credenciales
+            if (cloudinaryResponse.status === 404 && targetCloudName !== creds.cloudName) {
+              const fallbackUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}/assets`;
+              const retryResponse = await fetch(fallbackUrl, {
+                headers: { 'Authorization': `Basic ${creds.auth}`, 'Accept': 'application/json' }
+              });
+              if (retryResponse.ok) {
+                const retryData = await retryResponse.json();
+                processResources(retryData.resources, item, allPhotos);
+                continue;
+              }
             }
-            throw new Error(errorDetail);
+            throw new Error(errorMsg);
           }
 
           const data = await cloudinaryResponse.json();
+          processResources(data.resources, item, allPhotos);
 
-          if (data && data.resources) {
-            data.resources.forEach(asset => {
-              allPhotos.push({
-                id: asset.public_id,
-                url: asset.secure_url,
-                carpeta: item.carpeta,
-                nombre: asset.filename || asset.public_id.split('/').pop(),
-                fecha: asset.created_at,
-                formato: asset.format ? asset.format.toUpperCase() : 'IMG',
-                size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
-              });
-            });
-          }
         } catch (error) {
-          console.error(`Error en colección '${item.carpeta}':`, error.message);
+          console.error(`Error en '${item.carpeta}':`, error.message);
           allPhotos.push({
             ...item,
-            id: `err-${item.id}-${Math.random().toString(36).substr(2, 5)}`,
-            nombre: `${item.carpeta} (${error.message})`
+            id: `err-${item.id}`,
+            nombre: `${item.carpeta} (${error.message})`,
+            url: 'https://via.placeholder.com/400x300?text=Error+Coleccion'
           });
         }
       } else {
-        // Imagen única o registro normal
+        // Imagen individual
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
@@ -151,5 +148,24 @@ export default async function handler(request, response) {
   } catch (error) {
     console.error('Error crítico API:', error);
     return response.status(500).json({ error: error.message });
+  }
+}
+
+/**
+ * Helper para procesar recursos de Cloudinary y añadirlos a la lista
+ */
+function processResources(resources, sourceItem, list) {
+  if (resources && Array.isArray(resources)) {
+    resources.forEach(asset => {
+      list.push({
+        id: asset.public_id,
+        url: asset.secure_url,
+        carpeta: sourceItem.carpeta,
+        nombre: asset.filename || asset.public_id.split('/').pop(),
+        fecha: asset.created_at,
+        formato: asset.format ? asset.format.toUpperCase() : 'IMG',
+        size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
+      });
+    });
   }
 }
