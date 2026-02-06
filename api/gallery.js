@@ -32,7 +32,24 @@ export default async function handler(request, response) {
   if (!creds) return response.status(500).json({ error: 'Faltan credenciales de Cloudinary' });
 
   try {
-    const dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
+    let dbResult;
+    // INTENTO RESILIENTE DE CONSULTA SQL
+    try {
+      // Intento 1: Tabla con G mayúscula (sensible a mayúsculas)
+      dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
+    } catch (dbError) {
+      if (dbError.message.includes('relation') || dbError.message.includes('does not exist')) {
+        try {
+          // Intento 2: Tabla en minúsculas (estándar de Postgres)
+          dbResult = await sql`SELECT * FROM gallery ORDER BY id ASC`;
+        } catch (dbError2) {
+          throw new Error(`No se encontró la tabla 'Gallery' ni 'gallery'. Verifica el nombre en tu Dashboard de Vercel. Error: ${dbError2.message}`);
+        }
+      } else {
+        throw dbError;
+      }
+    }
+
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
@@ -41,7 +58,7 @@ export default async function handler(request, response) {
       let resources = [];
       let success = false;
 
-      // 1. INTENTO POR COLECCIÓN (Si hay URL)
+      // 1. INTENTO POR COLECCIÓN
       if (isCollectionUrl) {
         try {
           const urlObj = new URL(item.url);
@@ -57,19 +74,15 @@ export default async function handler(request, response) {
             const data = await res.json();
             resources = data.resources || [];
             success = true;
-          } else {
-            console.log(`Colección ${collectionId} falló con ${res.status}. Intentando fallback por carpeta...`);
           }
         } catch (e) {
-          console.error("Error parseando URL de colección:", e.message);
+          console.error("Error parseando colección:", e.message);
         }
       }
 
-      // 2. FALLBACK: BUSQUEDA POR CARPETA (Search API)
-      // Si no era colección, o si la colección dio 404, buscamos por el nombre de la carpeta
+      // 2. FALLBACK POR CARPETA (Si la colección falló o no existe ID)
       if (!success && item.carpeta) {
         try {
-          // La Search API es POST y permite filtrar por carpeta exacta
           const searchUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/resources/search`;
           const searchRes = await fetch(searchUrl, {
             method: 'POST',
@@ -94,7 +107,7 @@ export default async function handler(request, response) {
         }
       }
 
-      // Procesar los recursos encontrados
+      // Procesar resultados
       if (success && resources.length > 0) {
         resources.forEach(asset => {
           allPhotos.push({
@@ -108,28 +121,18 @@ export default async function handler(request, response) {
           });
         });
       } else if (!isCollectionUrl && item.url) {
-        // Es una imagen individual estática de la DB
+        // Registro estático (foto individual)
         allPhotos.push({
           ...item,
           id: item.id.toString(),
           nombre: item.nombre || 'Imagen'
-        });
-      } else if (isCollectionUrl && !success) {
-        // Caso de error total: no se encontró ni colección ni carpeta
-        allPhotos.push({
-          id: `err-${item.id}`,
-          url: `https://placehold.co/600x400/1a1a1a/white?text=No+se+encontro+contenido+en+${item.carpeta}`,
-          carpeta: item.carpeta,
-          nombre: 'Error de carga',
-          fecha: new Date().toISOString(),
-          formato: '!',
-          size: '0 MB'
         });
       }
     }
 
     return response.status(200).json(allPhotos);
   } catch (error) {
+    console.error('Error Crítico API:', error.message);
     return response.status(500).json({ error: error.message });
   }
 }
