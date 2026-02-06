@@ -1,32 +1,26 @@
 import { sql } from '@vercel/postgres';
 
 /**
- * Obtiene las credenciales de Cloudinary desde el entorno.
- * Formato: cloudinary://api_key:api_secret@cloud_name
+ * Parsea las credenciales de Cloudinary.
  */
 function getCloudinaryCredentials() {
   const rawUrl = process.env.CLOUDINARY_URL;
   if (!rawUrl) return null;
-
   try {
     const cleanUrl = rawUrl.replace(/[<>]/g, '').trim();
-    if (cleanUrl.startsWith('cloudinary://')) {
-      const url = new URL(cleanUrl);
-      return {
-        apiKey: url.username,
-        apiSecret: url.password,
-        cloudName: url.hostname,
-        auth: Buffer.from(`${url.username}:${url.password}`).toString('base64')
-      };
-    }
+    const url = new URL(cleanUrl);
+    return {
+      apiKey: url.username,
+      apiSecret: url.password,
+      cloudName: url.hostname,
+      auth: Buffer.from(`${url.username}:${url.password}`).toString('base64')
+    };
   } catch (err) {
-    console.error('Error parseando CLOUDINARY_URL:', err);
+    return null;
   }
-  return null;
 }
 
 export default async function handler(request, response) {
-  // Configuración de cabeceras para CORS y JSON
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -35,125 +29,107 @@ export default async function handler(request, response) {
   if (request.method === 'OPTIONS') return response.status(200).end();
 
   const creds = getCloudinaryCredentials();
+  if (!creds) return response.status(500).json({ error: 'Faltan credenciales de Cloudinary' });
 
   try {
-    if (!process.env.POSTGRES_URL) throw new Error('POSTGRES_URL no definida');
-
-    let dbResult;
-    try {
-      dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
-    } catch (e) {
-      dbResult = await sql`SELECT * FROM Gallery ORDER BY id ASC`;
-    }
-
+    const dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      // Detección de colecciones compartidas de Cloudinary
-      const isCollectionUrl = item.url && (
-        item.url.includes('collection.cloudinary.com') || 
-        item.url.includes('/collections/')
-      );
+      const isCollectionUrl = item.url && item.url.includes('cloudinary.com') && (item.url.includes('collection') || item.url.includes('collections'));
+      
+      let resources = [];
+      let success = false;
 
-      if (isCollectionUrl && creds) {
+      // 1. INTENTO POR COLECCIÓN (Si hay URL)
+      if (isCollectionUrl) {
         try {
           const urlObj = new URL(item.url);
-          const pathParts = urlObj.pathname.split('/').filter(Boolean);
+          const parts = urlObj.pathname.split('/').filter(Boolean);
+          const collectionId = parts.find(p => p.length > 20) || parts[parts.length - 1];
           
-          let cloudNameInUrl = '';
-          let collectionId = '';
+          const collUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}/assets`;
+          const res = await fetch(collUrl, {
+            headers: { 'Authorization': `Basic ${creds.auth}`, 'Accept': 'application/json' }
+          });
 
-          // Extracción de datos según el formato de URL
-          if (urlObj.hostname === 'collection.cloudinary.com') {
-            cloudNameInUrl = pathParts[0]; 
-            collectionId = pathParts[1];
+          if (res.ok) {
+            const data = await res.json();
+            resources = data.resources || [];
+            success = true;
           } else {
-            const collIdx = pathParts.indexOf('collections');
-            if (collIdx !== -1 && pathParts[collIdx + 1]) {
-              collectionId = pathParts[collIdx + 1];
-              if (collIdx > 0) cloudNameInUrl = pathParts[collIdx - 1];
-            }
+            console.log(`Colección ${collectionId} falló con ${res.status}. Intentando fallback por carpeta...`);
           }
-
-          if (!collectionId) throw new Error('No se encontró el ID de colección');
-
-          /**
-           * REGLA CRÍTICA: La Admin API de Cloudinary (/v1_1/:cloud_name) 
-           * solo permite acceder a recursos SI el cloud_name coincide con el de la API KEY.
-           * Si intentas consultar una colección de 'kalbo' con llaves de 'mi_nube', dará 404.
-           */
-          const targetCloud = creds.cloudName;
-          
-          // Si el cloud de la URL no es el tuyo, avisamos en logs pero intentamos con el tuyo
-          if (cloudNameInUrl && cloudNameInUrl !== targetCloud) {
-            console.warn(`Aviso: La colección pertenece a '${cloudNameInUrl}' pero tu API KEY es de '${targetCloud}'. Cloudinary denegará el acceso si no eres el dueño.`);
-          }
-
-          const apiUrl = `https://api.cloudinary.com/v1_1/${targetCloud}/collections/${collectionId}/assets`;
-          
-          const cloudinaryResponse = await fetch(apiUrl, {
-            headers: {
-              'Authorization': `Basic ${creds.auth}`,
-              'Accept': 'application/json'
-            }
-          });
-
-          if (!cloudinaryResponse.ok) {
-            const errorText = await cloudinaryResponse.text();
-            let errorMessage = `Error ${cloudinaryResponse.status}`;
-            try {
-              const errorData = JSON.parse(errorText);
-              errorMessage = errorData.error?.message || errorMessage;
-            } catch (e) {}
-
-            if (cloudinaryResponse.status === 404) {
-              throw new Error(`404: La colección '${collectionId}' no se encuentra en tu cuenta (${targetCloud}).`);
-            }
-            throw new Error(errorMessage);
-          }
-
-          const data = await cloudinaryResponse.json();
-          
-          if (data && Array.isArray(data.resources)) {
-            data.resources.forEach(asset => {
-              allPhotos.push({
-                id: asset.public_id,
-                url: asset.secure_url,
-                carpeta: item.carpeta || 'Colección',
-                nombre: asset.filename || asset.public_id.split('/').pop(),
-                fecha: asset.created_at,
-                formato: asset.format ? asset.format.toUpperCase() : 'IMG',
-                size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
-              });
-            });
-          }
-        } catch (error) {
-          console.error(`Error procesando colección '${item.carpeta}':`, error.message);
-          // Fallback visual para el error en la interfaz
-          allPhotos.push({
-            id: `error-${item.id}`,
-            url: `https://placehold.co/600x400/111/white?text=Error+en+${item.carpeta}`,
-            carpeta: item.carpeta,
-            nombre: `Error: ${error.message}`,
-            fecha: new Date().toISOString(),
-            formato: '!',
-            size: '0 MB'
-          });
+        } catch (e) {
+          console.error("Error parseando URL de colección:", e.message);
         }
-      } else {
-        // Registro de imagen única normal
+      }
+
+      // 2. FALLBACK: BUSQUEDA POR CARPETA (Search API)
+      // Si no era colección, o si la colección dio 404, buscamos por el nombre de la carpeta
+      if (!success && item.carpeta) {
+        try {
+          // La Search API es POST y permite filtrar por carpeta exacta
+          const searchUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/resources/search`;
+          const searchRes = await fetch(searchUrl, {
+            method: 'POST',
+            headers: { 
+              'Authorization': `Basic ${creds.auth}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              expression: `folder:"${item.carpeta}/*" OR folder:"${item.carpeta}"`,
+              max_results: 100,
+              sort_by: [{ created_at: "desc" }]
+            })
+          });
+
+          if (searchRes.ok) {
+            const data = await searchRes.json();
+            resources = data.resources || [];
+            success = true;
+          }
+        } catch (e) {
+          console.error("Error en Search API:", e.message);
+        }
+      }
+
+      // Procesar los recursos encontrados
+      if (success && resources.length > 0) {
+        resources.forEach(asset => {
+          allPhotos.push({
+            id: asset.public_id,
+            url: asset.secure_url,
+            carpeta: item.carpeta || 'General',
+            nombre: asset.filename || asset.public_id.split('/').pop(),
+            fecha: asset.created_at,
+            formato: (asset.format || 'img').toUpperCase(),
+            size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
+          });
+        });
+      } else if (!isCollectionUrl && item.url) {
+        // Es una imagen individual estática de la DB
         allPhotos.push({
           ...item,
-          id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
+          id: item.id.toString(),
           nombre: item.nombre || 'Imagen'
+        });
+      } else if (isCollectionUrl && !success) {
+        // Caso de error total: no se encontró ni colección ni carpeta
+        allPhotos.push({
+          id: `err-${item.id}`,
+          url: `https://placehold.co/600x400/1a1a1a/white?text=No+se+encontro+contenido+en+${item.carpeta}`,
+          carpeta: item.carpeta,
+          nombre: 'Error de carga',
+          fecha: new Date().toISOString(),
+          formato: '!',
+          size: '0 MB'
         });
       }
     }
 
     return response.status(200).json(allPhotos);
-
   } catch (error) {
-    console.error('Error crítico en la API:', error);
     return response.status(500).json({ error: error.message });
   }
 }
