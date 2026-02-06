@@ -1,34 +1,31 @@
-
 import { Photo } from '../types';
 
 export const fetchPhotos = async (): Promise<Photo[]> => {
   try {
     const response = await fetch('/api/gallery');
-    
-    if (response.ok) {
-      const data = await response.json();
-      
-      // Validar que data sea un array
-      if (!Array.isArray(data)) {
-        console.error('La API no devolvió un array:', data);
-        return [];
-      }
-      
-      return data.map((item: any) => ({
-        id: item.id?.toString() || Math.random().toString(),
-        url: item.url, 
-        carpeta: item.carpeta || 'General',
-        nombre: item.nombre || 'Imagen',
-        fecha: item.fecha ? new Date(item.fecha).toLocaleDateString() : new Date().toLocaleDateString(),
-        formato: item.formato || 'JPG',
-        size: item.size || 'N/A'
-      }));
-    } else {
-      console.error('Error cargando API:', response.status);
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Error de API:', data.error || response.statusText);
       return [];
     }
+    
+    if (!Array.isArray(data)) {
+      console.error('La API no devolvió un array:', data);
+      return [];
+    }
+    
+    return data.map((item: any) => ({
+      id: item.id?.toString() || Math.random().toString(),
+      url: item.url, 
+      carpeta: item.carpeta || 'General',
+      nombre: item.nombre || 'Imagen',
+      fecha: item.fecha ? new Date(item.fecha).toLocaleDateString() : new Date().toLocaleDateString(),
+      formato: item.formato || 'JPG',
+      size: item.size || 'N/A'
+    }));
   } catch (err) {
-    console.error('Error de red:', err);
+    console.error('Error de red o parseo:', err);
     return [];
   }
 };

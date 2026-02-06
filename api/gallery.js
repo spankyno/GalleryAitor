@@ -1,7 +1,7 @@
 import { sql } from '@vercel/postgres';
 
 /**
- * Parsea las credenciales de Cloudinary.
+ * Extrae credenciales de CLOUDINARY_URL
  */
 function getCloudinaryCredentials() {
   const rawUrl = process.env.CLOUDINARY_URL;
@@ -20,6 +20,34 @@ function getCloudinaryCredentials() {
   }
 }
 
+/**
+ * Intenta extraer el Cloud Name y el ID de una URL de colección de Cloudinary
+ */
+function parseCollectionUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+    const parts = url.pathname.split('/').filter(Boolean);
+    
+    // Formato: https://collection.cloudinary.com/cloud_name/id
+    if (url.hostname === 'collection.cloudinary.com') {
+      return {
+        cloudName: parts[0],
+        collectionId: parts[1]
+      };
+    }
+    
+    // Formato: https://cloudinary.com/collections/id
+    const collIdx = parts.indexOf('collections');
+    if (collIdx !== -1 && parts[collIdx + 1]) {
+      return {
+        cloudName: null, // Asumir el propio
+        collectionId: parts[collIdx + 1]
+      };
+    }
+  } catch (e) {}
+  return null;
+}
+
 export default async function handler(request, response) {
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -33,39 +61,26 @@ export default async function handler(request, response) {
 
   try {
     let dbResult;
-    // INTENTO RESILIENTE DE CONSULTA SQL
     try {
-      // Intento 1: Tabla con G mayúscula (sensible a mayúsculas)
       dbResult = await sql`SELECT * FROM "Gallery" ORDER BY id ASC`;
-    } catch (dbError) {
-      if (dbError.message.includes('relation') || dbError.message.includes('does not exist')) {
-        try {
-          // Intento 2: Tabla en minúsculas (estándar de Postgres)
-          dbResult = await sql`SELECT * FROM gallery ORDER BY id ASC`;
-        } catch (dbError2) {
-          throw new Error(`No se encontró la tabla 'Gallery' ni 'gallery'. Verifica el nombre en tu Dashboard de Vercel. Error: ${dbError2.message}`);
-        }
-      } else {
-        throw dbError;
-      }
+    } catch (e) {
+      dbResult = await sql`SELECT * FROM gallery ORDER BY id ASC`;
     }
 
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      const isCollectionUrl = item.url && item.url.includes('cloudinary.com') && (item.url.includes('collection') || item.url.includes('collections'));
-      
+      const collectionInfo = item.url ? parseCollectionUrl(item.url) : null;
       let resources = [];
-      let success = false;
+      let found = false;
 
-      // 1. INTENTO POR COLECCIÓN
-      if (isCollectionUrl) {
+      // CASO 1: ES UNA COLECCIÓN
+      if (collectionInfo) {
         try {
-          const urlObj = new URL(item.url);
-          const parts = urlObj.pathname.split('/').filter(Boolean);
-          const collectionId = parts.find(p => p.length > 20) || parts[parts.length - 1];
+          // Usar el cloud name de la URL si existe, si no el de las credenciales
+          const targetCloud = collectionInfo.cloudName || creds.cloudName;
+          const collUrl = `https://api.cloudinary.com/v1_1/${targetCloud}/collections/${collectionInfo.collectionId}/assets`;
           
-          const collUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}/assets`;
           const res = await fetch(collUrl, {
             headers: { 'Authorization': `Basic ${creds.auth}`, 'Accept': 'application/json' }
           });
@@ -73,15 +88,18 @@ export default async function handler(request, response) {
           if (res.ok) {
             const data = await res.json();
             resources = data.resources || [];
-            success = true;
+            found = true;
+          } else {
+            console.log(`Colección ${collectionInfo.collectionId} falló con status ${res.status}.`);
           }
         } catch (e) {
-          console.error("Error parseando colección:", e.message);
+          console.error("Error consultando colección:", e.message);
         }
       }
 
-      // 2. FALLBACK POR CARPETA (Si la colección falló o no existe ID)
-      if (!success && item.carpeta) {
+      // CASO 2 o FALLBACK: ES UNA CARPETA (O búsqueda por nombre de colección como carpeta)
+      // Si no se encontraron recursos por colección, intentamos buscar una carpeta con ese nombre
+      if (!found && item.carpeta) {
         try {
           const searchUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/resources/search`;
           const searchRes = await fetch(searchUrl, {
@@ -91,24 +109,24 @@ export default async function handler(request, response) {
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({
+              // Buscamos en la carpeta o que contenga el nombre en el path
               expression: `folder:"${item.carpeta}/*" OR folder:"${item.carpeta}"`,
-              max_results: 100,
-              sort_by: [{ created_at: "desc" }]
+              max_results: 100
             })
           });
 
           if (searchRes.ok) {
             const data = await searchRes.json();
             resources = data.resources || [];
-            success = true;
+            found = true;
           }
         } catch (e) {
           console.error("Error en Search API:", e.message);
         }
       }
 
-      // Procesar resultados
-      if (success && resources.length > 0) {
+      // PROCESAMIENTO DE RESULTADOS
+      if (found && resources.length > 0) {
         resources.forEach(asset => {
           allPhotos.push({
             id: asset.public_id,
@@ -120,8 +138,8 @@ export default async function handler(request, response) {
             size: asset.bytes ? (asset.bytes / 1024 / 1024).toFixed(2) + ' MB' : 'N/A'
           });
         });
-      } else if (!isCollectionUrl && item.url) {
-        // Registro estático (foto individual)
+      } else if (item.url && !collectionInfo) {
+        // Es una imagen individual estática
         allPhotos.push({
           ...item,
           id: item.id.toString(),
@@ -132,7 +150,7 @@ export default async function handler(request, response) {
 
     return response.status(200).json(allPhotos);
   } catch (error) {
-    console.error('Error Crítico API:', error.message);
+    console.error('Error crítico:', error.message);
     return response.status(500).json({ error: error.message });
   }
 }
