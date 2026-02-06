@@ -48,24 +48,48 @@ export default async function handler(request, response) {
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      const isCollection = item.url && (item.url.includes('collection.cloudinary.com') || item.url.includes('/collections/'));
+      // Detección de URL de colección
+      const isCollection = item.url && (
+        item.url.includes('collection.cloudinary.com') || 
+        item.url.includes('/collections/')
+      );
 
       if (isCollection && creds) {
         try {
-          // Extracción robusta del ID: busca /collections/ID o toma el último segmento antes de posibles parámetros
+          /**
+           * ANALISIS DE LA URL DE COLECCION
+           * Ejemplo: https://collection.cloudinary.com/mi-cloud/abc123def456/view
+           */
+          const urlObj = new URL(item.url);
+          const pathParts = urlObj.pathname.split('/').filter(Boolean);
+          
+          let targetCloudName = creds.cloudName;
           let collectionId = '';
-          const match = item.url.match(/\/collections\/([^\/\?\#]+)/);
-          if (match) {
-            collectionId = match[1];
+
+          if (urlObj.hostname === 'collection.cloudinary.com') {
+            // En collection.cloudinary.com, el primer path suele ser el cloud name
+            // y el segundo es el ID de la colección.
+            if (pathParts.length >= 2) {
+              targetCloudName = pathParts[0];
+              collectionId = pathParts[1];
+            }
           } else {
-            // Si es una URL limpia tipo .../cloudname/id, quitamos el cloudname
-            const parts = item.url.split('/').filter(p => p && p !== 'view');
-            collectionId = parts.pop();
+            // URLs tipo .../v1_1/cloudname/collections/id
+            const collIndex = pathParts.indexOf('collections');
+            if (collIndex !== -1 && pathParts[collIndex + 1]) {
+              collectionId = pathParts[collIndex + 1];
+              // El cloudName suele estar antes de /collections/
+              if (collIndex > 0) targetCloudName = pathParts[collIndex - 1];
+            } else {
+              // Fallback: último segmento
+              collectionId = pathParts.filter(p => p !== 'view' && p !== 'edit').pop();
+            }
           }
           
-          if (!collectionId) throw new Error('ID de colección no detectado');
+          if (!collectionId) throw new Error('No se pudo identificar el ID de la colección');
 
-          // El cloudName debe ser el que tenemos en las credenciales
+          // IMPORTANTE: La API de Administración SIEMPRE usa el Cloud Name asociado a la API Key.
+          // Si la colección pertenece a otro Cloud Name, la API Key debe tener permisos sobre él.
           const apiUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}`;
           
           const cloudinaryResponse = await fetch(apiUrl, {
@@ -75,17 +99,18 @@ export default async function handler(request, response) {
             }
           });
 
-          const contentType = cloudinaryResponse.headers.get('content-type');
-          
           if (!cloudinaryResponse.ok) {
-            let errorMsg = `Error ${cloudinaryResponse.status}`;
-            if (contentType && contentType.includes('application/json')) {
-              const errorData = await cloudinaryResponse.json();
-              errorMsg = errorData.error?.message || errorMsg;
-            } else if (cloudinaryResponse.status === 404) {
-              errorMsg = "ID no encontrado en este Cloud Name";
+            const errorText = await cloudinaryResponse.text();
+            let errorDetail = `Error ${cloudinaryResponse.status}`;
+            try {
+              const errorData = JSON.parse(errorText);
+              errorDetail = errorData.error?.message || errorDetail;
+            } catch (e) {}
+            
+            if (cloudinaryResponse.status === 404) {
+              throw new Error(`Colección no encontrada (ID: ${collectionId} en Cloud: ${creds.cloudName})`);
             }
-            throw new Error(errorMsg);
+            throw new Error(errorDetail);
           }
 
           const data = await cloudinaryResponse.json();
@@ -112,7 +137,7 @@ export default async function handler(request, response) {
           });
         }
       } else {
-        // Imagen única o registro manual
+        // Imagen única o registro normal
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
