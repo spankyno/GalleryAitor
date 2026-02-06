@@ -2,6 +2,7 @@ import { sql } from '@vercel/postgres';
 
 /**
  * Extrae credenciales de la URL de Cloudinary de forma robusta.
+ * Formato: cloudinary://api_key:api_secret@cloud_name
  */
 function getCloudinaryCredentials() {
   const rawUrl = process.env.CLOUDINARY_URL;
@@ -47,15 +48,24 @@ export default async function handler(request, response) {
     const allPhotos = [];
 
     for (const item of dbResult.rows) {
-      const isCollection = item.url && item.url.includes('collection.cloudinary.com');
+      const isCollection = item.url && (item.url.includes('collection.cloudinary.com') || item.url.includes('/collections/'));
 
       if (isCollection && creds) {
         try {
-          // Extraer ID de forma segura (ignorando slashes al final)
-          const collectionId = item.url.split('/').filter(Boolean).pop();
+          // Extracción robusta del ID: busca /collections/ID o toma el último segmento antes de posibles parámetros
+          let collectionId = '';
+          const match = item.url.match(/\/collections\/([^\/\?\#]+)/);
+          if (match) {
+            collectionId = match[1];
+          } else {
+            // Si es una URL limpia tipo .../cloudname/id, quitamos el cloudname
+            const parts = item.url.split('/').filter(p => p && p !== 'view');
+            collectionId = parts.pop();
+          }
           
-          if (!collectionId) throw new Error('No se pudo determinar el ID de la colección');
+          if (!collectionId) throw new Error('ID de colección no detectado');
 
+          // El cloudName debe ser el que tenemos en las credenciales
           const apiUrl = `https://api.cloudinary.com/v1_1/${creds.cloudName}/collections/${collectionId}`;
           
           const cloudinaryResponse = await fetch(apiUrl, {
@@ -68,16 +78,14 @@ export default async function handler(request, response) {
           const contentType = cloudinaryResponse.headers.get('content-type');
           
           if (!cloudinaryResponse.ok) {
-            let errorMsg = `HTTP ${cloudinaryResponse.status}`;
+            let errorMsg = `Error ${cloudinaryResponse.status}`;
             if (contentType && contentType.includes('application/json')) {
               const errorData = await cloudinaryResponse.json();
               errorMsg = errorData.error?.message || errorMsg;
+            } else if (cloudinaryResponse.status === 404) {
+              errorMsg = "ID no encontrado en este Cloud Name";
             }
             throw new Error(errorMsg);
-          }
-
-          if (!contentType || !contentType.includes('application/json')) {
-            throw new Error('La respuesta de Cloudinary no es JSON (posible URL incorrecta o bloqueo)');
           }
 
           const data = await cloudinaryResponse.json();
@@ -100,10 +108,11 @@ export default async function handler(request, response) {
           allPhotos.push({
             ...item,
             id: `err-${item.id}-${Math.random().toString(36).substr(2, 5)}`,
-            nombre: `${item.carpeta} (Error: ${error.message})`
+            nombre: `${item.carpeta} (${error.message})`
           });
         }
       } else {
+        // Imagen única o registro manual
         allPhotos.push({
           ...item,
           id: item.id?.toString() || Math.random().toString(36).substr(2, 9),
